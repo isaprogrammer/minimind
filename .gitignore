@@ -4,4 +4,6 @@ __pycache__/
 out
 website/
 docs-minimind/
-.idea/
+.idea/.venv/
+checkpoints/
+dataset/smoke_*.jsonl
