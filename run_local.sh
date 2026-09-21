@@ -11,6 +11,7 @@
 #   ./run_local.sh train    # 5. 完整训练 pretrain + full_sft(M1 Pro 预计数天)
 #   ./run_local.sh eval     # 6. 用训好的 full_sft 权重自动对话测试
 #   ./run_local.sh all      # 以上全部按序执行
+#   ./run_local.sh profile  # pyinstrument 剖析: 跑一遍冒烟预训练, 输出 Python 栈热点报告
 #
 # 可选环境变量:
 #   TORCH_VERSION=2.6.0     torch 版本(默认取 requirements.txt 注释中仓库测试过的版本)
@@ -19,12 +20,14 @@
 #   EPOCHS_PRETRAIN=2       预训练轮数
 #   EPOCHS_SFT=2            SFT 轮数
 #   RESUME=1                断点续训(透传 --from_resume 1)
+#   PROFILE=1               训练时启用 pyinstrument 剖析(结束时生成 profile_*.html)
+#   PROFILE_FROM=600        PROFILE=1 时延迟 N 秒开始采样(跳过启动阶段, 减小报告体积)
 # ==============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VENV=".venv"
-VENV_PY="$(pwd)/$VENV/bin/python"
+VENV="$(pwd)/.venv"   # 绝对路径: trainer/ 子目录中的调用不受 cd 影响
+VENV_PY="$VENV/bin/python"
 TORCH_VERSION="${TORCH_VERSION:-2.6.0}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 EPOCHS_PRETRAIN="${EPOCHS_PRETRAIN:-2}"
@@ -159,11 +162,8 @@ stage_data() {
 # 阶段 4: 冒烟测试 — 合成小数据跑通 训练→SFT→推理 全链路(不依赖数据集下载)
 # 注: 模型在这些数据上学不到东西，输出乱码属正常，本阶段只验证代码链路
 # ==============================================================================
-stage_smoke() {
-  [ -x "$VENV_PY" ] || die "请先运行 ./run_local.sh install"
-  DEVICE=$(detect_device)
-  [ "$DEVICE" = "mps" ] || warn "未检测到 MPS，将用 CPU 运行，冒烟测试会慢一些"
-  info "设备: $DEVICE | 生成合成冒烟数据 ..."
+# 生成合成冒烟数据(200条预训练 + 150条SFT), 供 smoke / profile 阶段共用
+gen_smoke_data() {
   "$VENV_PY" - <<'PY'
 import json, random
 random.seed(42)
@@ -203,6 +203,13 @@ with open('dataset/smoke_sft.jsonl', 'w', encoding='utf-8') as f:
         f.write(json.dumps({"conversations": [msg("user", q), msg("assistant", a)]}, ensure_ascii=False) + "\n")
 print("已生成 dataset/smoke_pretrain.jsonl (200条) 和 dataset/smoke_sft.jsonl (150条)")
 PY
+}
+
+stage_smoke() {
+  [ -x "$VENV_PY" ] || die "请先运行 ./run_local.sh install"
+  DEVICE=$(detect_device)
+  [ "$DEVICE" = "mps" ] || warn "未检测到 MPS，将用 CPU 运行，冒烟测试会慢一些"
+  gen_smoke_data
 
   info "[1/3] 冒烟预训练 (200 条, 1 epoch) ..."
   (cd trainer && $CAFFE "$VENV_PY" train_pretrain.py --device "$DEVICE" --num_workers 2 \
@@ -234,16 +241,28 @@ stage_train() {
   EXTRA=""
   [ "$RESUME" = "1" ] && EXTRA="--from_resume 1"
 
+  # PROFILE=1: 用 pyinstrument 包住训练(进程内采样 Python 栈, 免 root)
+  RUN_PRE="$VENV_PY"; RUN_SFT="$VENV_PY"
+  if [ "${PROFILE:-0}" = "1" ]; then
+    [ -x "$VENV/bin/pyinstrument" ] || "$VENV/bin/pip" install -q pyinstrument
+    FROM=""
+    if [ -n "${PROFILE_FROM:-}" ]; then FROM="--from $PROFILE_FROM"; fi
+    RUN_PRE="$VENV/bin/pyinstrument -r html $FROM -o ../profile_pretrain.html --"
+    RUN_SFT="$VENV/bin/pyinstrument -r html $FROM -o ../profile_full_sft.html --"
+    warn "PROFILE=1: 训练结束生成 profile_pretrain.html / profile_full_sft.html; 多日长训建议配 PROFILE_FROM=600, 且仅在需要时开启"
+  fi
+
   warn "参考: RTX 3090 上 pretrain_mini 约 1.2h/轮; ${DEVICE} 预计慢 10~20 倍, 完整训练可能需数天"
   warn "建议在 tmux/screen 中运行; 中断后可用 RESUME=1 ./run_local.sh train 续训(自动跳过已训 step)"
+  warn "性能分析: PROFILE=1 ./run_local.sh train 训练全程剖析; ./run_local.sh profile 快速看热点分布"
 
   info "[1/2] 预训练 (epochs=$EPOCHS_PRETRAIN, 设备=$DEVICE) ..."
-  (cd trainer && $CAFFE "$VENV_PY" train_pretrain.py --device "$DEVICE" \
+  (cd trainer && $CAFFE $RUN_PRE train_pretrain.py --device "$DEVICE" \
       --num_workers "$NUM_WORKERS" --epochs "$EPOCHS_PRETRAIN" $EXTRA)
   [ -f out/pretrain_768.pth ] || die "预训练未产出 out/pretrain_768.pth"
 
   info "[2/2] SFT (epochs=$EPOCHS_SFT) ..."
-  (cd trainer && $CAFFE "$VENV_PY" train_full_sft.py --device "$DEVICE" \
+  (cd trainer && $CAFFE $RUN_SFT train_full_sft.py --device "$DEVICE" \
       --num_workers "$NUM_WORKERS" --epochs "$EPOCHS_SFT" $EXTRA)
   [ -f out/full_sft_768.pth ] || die "SFT 未产出 out/full_sft_768.pth"
 
@@ -263,7 +282,30 @@ stage_eval() {
   ok "评测完成; 交互式对话请手动运行: python eval_llm.py --weight full_sft --device $DEVICE"
 }
 
-usage() { sed -n '2,25p' "$0" | cut -c3-; }
+usage() { sed -n '2,/^# ==*$/p' "$0" | cut -c3-; }
+
+# ==============================================================================
+# 附加: pyinstrument 性能剖析 (进程内 Python 栈采样, 免 root, 无需 attach)
+# 用法: ./run_local.sh profile    —— 用冒烟数据完整跑一遍预训练, 生成热点报告 profile_pyinstrument.html
+#       正式训练剖析: PROFILE=1 ./run_local.sh train (可选 PROFILE_FROM=600 延迟采样)
+# ==============================================================================
+stage_profile() {
+  [ -x "$VENV_PY" ] || die "请先运行 ./run_local.sh install"
+  DEVICE=$(detect_device)
+  [ -f dataset/smoke_pretrain.jsonl ] || gen_smoke_data
+  if [ ! -x "$VENV/bin/pyinstrument" ]; then
+    info "安装 pyinstrument ..."
+    "$VENV/bin/pip" install -q pyinstrument
+  fi
+  OUT="$(pwd)/profile_pyinstrument.html"
+  info "pyinstrument 剖析: 冒烟数据跑预训练 (设备=$DEVICE, 约1分钟) ..."
+  (cd trainer && $CAFFE "$VENV/bin/pyinstrument" -r html -o "$OUT" -- \
+      train_pretrain.py --device "$DEVICE" --num_workers 0 \
+      --data_path ../dataset/smoke_pretrain.jsonl --save_weight profile_test \
+      --epochs 1 --batch_size 8 --max_seq_len 128 --log_interval 5)
+  rm -f out/profile_test_768.pth checkpoints/profile_test_768.pth checkpoints/profile_test_768_resume.pth
+  ok "剖析完成: $OUT (浏览器打开; 时间轴可点击下钻到函数和源码行)"
+}
 
 case "${1:-}" in
   check)   stage_check ;;
@@ -272,6 +314,7 @@ case "${1:-}" in
   smoke)   stage_smoke ;;
   train)   stage_train ;;
   eval)    stage_eval ;;
+  profile) stage_profile ;;
   all)     stage_check; stage_install; stage_data; stage_smoke; stage_train; stage_eval ;;
   -h|--help|"") usage ;;
   *) usage; die "未知阶段: $1" ;;
